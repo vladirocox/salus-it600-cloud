@@ -110,7 +110,7 @@ class SalusCloudSwitch(CoordinatorEntity[SalusCloudCoordinator], SwitchEntity):
         shadow_props = data.get("_shadow_properties", {})
         if shadow_props:
             # Check OnOff state from shadow
-            on_off = shadow_props.get("ep9:sOnOffS:OnOff")
+            on_off = shadow_props.get("ep2:sOnOffS:OnOff")
             if on_off is not None:
                 return on_off == 1
 
@@ -134,8 +134,8 @@ class SalusCloudSwitch(CoordinatorEntity[SalusCloudCoordinator], SwitchEntity):
         try:
             await self.coordinator.gateway.set_switch_state(self._device_code, True)
 
-            # Request immediate coordinator refresh to get updated state
-            await self.coordinator.async_request_refresh()
+            # Force immediate refresh to get updated state
+            await self.coordinator.async_force_refresh()
 
         except Exception as err:
             _LOGGER.error("Failed to turn on switch: %s", err)
@@ -149,8 +149,8 @@ class SalusCloudSwitch(CoordinatorEntity[SalusCloudCoordinator], SwitchEntity):
         try:
             await self.coordinator.gateway.set_switch_state(self._device_code, False)
 
-            # Request immediate coordinator refresh to get updated state
-            await self.coordinator.async_request_refresh()
+            # Force immediate refresh to get updated state
+            await self.coordinator.async_force_refresh()
 
         except Exception as err:
             _LOGGER.error("Failed to turn off switch: %s", err)

@@ -153,7 +153,7 @@ class SalusCloudClimate(CoordinatorEntity[SalusCloudCoordinator], ClimateEntity)
         shadow_props = data.get("_shadow_properties", {})
         if shadow_props:
             # Look for LocalTemperature_x100 in shadow properties
-            temp_x100 = shadow_props.get("ep9:sIT600TH:LocalTemperature_x100")
+            temp_x100 = shadow_props.get("ep1:sTherS:LocalTemperature_x100")
             if temp_x100 is not None:
                 return temp_x100 / 100.0
 
@@ -176,7 +176,7 @@ class SalusCloudClimate(CoordinatorEntity[SalusCloudCoordinator], ClimateEntity)
         shadow_props = data.get("_shadow_properties", {})
         if shadow_props:
             # Look for HeatingSetpoint_x100 in shadow properties
-            temp_x100 = shadow_props.get("ep9:sIT600TH:HeatingSetpoint_x100")
+            temp_x100 = shadow_props.get("ep1:sTherS:HeatingSetpoint_x100")
             if temp_x100 is not None:
                 return temp_x100 / 100.0
 
@@ -199,12 +199,12 @@ class SalusCloudClimate(CoordinatorEntity[SalusCloudCoordinator], ClimateEntity)
         shadow_props = data.get("_shadow_properties", {})
         if shadow_props:
             # Check HoldType first - Standby/Frost mode (7) should be OFF
-            hold_type = shadow_props.get("ep9:sIT600TH:HoldType")
+            hold_type = shadow_props.get("ep1:sComm:HoldType")
             if hold_type == 7:  # Standby/Frost mode
                 return HVACMode.OFF
 
             # Check SystemMode (0 = off, 4 = heat)
-            system_mode = shadow_props.get("ep9:sIT600TH:SystemMode")
+            system_mode = shadow_props.get("ep1:sTherS:SystemMode")
             if system_mode == 0:
                 return HVACMode.OFF
             # mode 4 = heat, default to HEAT
@@ -231,7 +231,7 @@ class SalusCloudClimate(CoordinatorEntity[SalusCloudCoordinator], ClimateEntity)
         shadow_props = data.get("_shadow_properties", {})
         if shadow_props:
             # Check RunningState (1 = heating, 0 = idle)
-            running_state = shadow_props.get("ep9:sIT600TH:RunningState")
+            running_state = shadow_props.get("ep1:sTherS:RunningState")
             if running_state == 1:
                 return HVACAction.HEATING
             elif running_state == 0:
@@ -247,7 +247,7 @@ class SalusCloudClimate(CoordinatorEntity[SalusCloudCoordinator], ClimateEntity)
         # Get HoldType from shadow properties
         shadow_props = data.get("_shadow_properties", {})
         if shadow_props:
-            hold_type = shadow_props.get("ep9:sIT600TH:HoldType")
+            hold_type = shadow_props.get("ep1:sComm:HoldType")
             if hold_type is not None:
                 return HOLDTYPE_TO_PRESET.get(hold_type, PRESET_MANUAL)
 
@@ -265,8 +265,8 @@ class SalusCloudClimate(CoordinatorEntity[SalusCloudCoordinator], ClimateEntity)
         try:
             await self.coordinator.gateway.set_temperature(self._device_code, temperature)
 
-            # Request immediate coordinator refresh to get updated state
-            await self.coordinator.async_request_refresh()
+            # Force immediate refresh to get updated state
+            await self.coordinator.async_force_refresh()
 
         except Exception as err:
             _LOGGER.error("Failed to set temperature: %s", err)
@@ -298,30 +298,27 @@ class SalusCloudClimate(CoordinatorEntity[SalusCloudCoordinator], ClimateEntity)
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Set new HVAC mode.
 
-        Maps HVAC modes to preset modes:
-        - OFF → Away/Frost mode (HoldType=7)
-        - HEAT → Schedule mode (HoldType=0)
+        Directly sets SystemMode via MQTT shadow update:
+        - OFF → SystemMode=0
+        - HEAT → SystemMode=4
         """
         _LOGGER.info("Setting HVAC mode for %s to %s", self._attr_name, hvac_mode)
 
-        # Map HVAC mode to HoldType
         if hvac_mode == HVACMode.OFF:
-            hold_type = 7  # Frost/Away mode
-            mode_name = "frost/away"
+            system_mode = 0
         elif hvac_mode == HVACMode.HEAT:
-            hold_type = 0  # Schedule mode
-            mode_name = "schedule"
+            system_mode = 4
         else:
             _LOGGER.error("Unsupported HVAC mode: %s", hvac_mode)
             from homeassistant.exceptions import HomeAssistantError
             raise HomeAssistantError(f"Unsupported HVAC mode: {hvac_mode}")
 
         try:
-            _LOGGER.debug("Setting HVAC mode %s → HoldType %d (%s)", hvac_mode, hold_type, mode_name)
-            await self.coordinator.gateway.set_hold_mode(self._device_code, hold_type)
+            _LOGGER.debug("Setting HVAC mode %s → SystemMode %d", hvac_mode, system_mode)
+            await self.coordinator.gateway.set_system_mode(self._device_code, system_mode)
 
-            # Request immediate coordinator refresh to get updated state
-            await self.coordinator.async_request_refresh()
+            # Force immediate refresh to reflect the new state
+            await self.coordinator.async_force_refresh()
 
         except Exception as err:
             _LOGGER.error("Failed to set HVAC mode: %s", err)
@@ -337,7 +334,7 @@ class SalusCloudClimate(CoordinatorEntity[SalusCloudCoordinator], ClimateEntity)
         attrs = {}
 
         # Add hold type info
-        hold_type = shadow_props.get("ep9:sIT600TH:HoldType")
+        hold_type = shadow_props.get("ep1:sComm:HoldType")
         if hold_type is not None:
             hold_type_names = {
                 0: "Schedule",
@@ -347,7 +344,7 @@ class SalusCloudClimate(CoordinatorEntity[SalusCloudCoordinator], ClimateEntity)
             attrs["hold_type"] = hold_type_names.get(hold_type, f"Unknown ({hold_type})")
 
         # Add system mode
-        system_mode = shadow_props.get("ep9:sIT600TH:SystemMode")
+        system_mode = shadow_props.get("ep1:sTherS:SystemMode")
         if system_mode is not None:
             system_mode_names = {
                 0: "Off",
@@ -357,12 +354,12 @@ class SalusCloudClimate(CoordinatorEntity[SalusCloudCoordinator], ClimateEntity)
             attrs["system_mode"] = system_mode_names.get(system_mode, f"Unknown ({system_mode})")
 
         # Add battery level if available
-        battery_level = shadow_props.get("ep9:sBasicS:BatteryVoltage")
+        battery_level = shadow_props.get("ep1:sPowerS:BatteryVoltage_x10")
         if battery_level is not None:
             attrs["battery_voltage"] = f"{battery_level / 10:.1f}V"
 
         # Add running state
-        running_state = shadow_props.get("ep9:sIT600TH:RunningState")
+        running_state = shadow_props.get("ep1:sTherS:RunningState")
         if running_state is not None:
             attrs["running_state"] = "Heating" if running_state == 1 else "Idle"
 

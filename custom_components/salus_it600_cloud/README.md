@@ -165,8 +165,8 @@ Temperature and mode changes are sent via MQTT to AWS IoT device shadows using t
     "desired": {
       "11": {
         "properties": {
-          "ep9:sIT600TH:SetHeatingSetpoint_x100": 2100,
-          "ep9:sIT600TH:SetHoldType": 2
+          "ep1:sTherS:SetHeatingSetpoint_x100": 2100,
+          "ep1:sComm:SetHoldType": 2
         }
       }
     }

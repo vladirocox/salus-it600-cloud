@@ -35,6 +35,38 @@ class SalusCloudCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._gateway_id: str = ""
         self._gateway_code: str = ""
 
+    async def async_force_refresh(self) -> None:
+        """Force an immediate data refresh bypassing the debounce."""
+        try:
+            _LOGGER.debug("Starting forced refresh")
+            data = await self._async_update_data()
+            self.async_set_updated_data(data)
+            _LOGGER.debug("Forced refresh completed")
+        except Exception as err:
+            _LOGGER.error("Forced refresh failed: %s", err)
+
+    def _handle_shadow_update(self, device_code: str, shadow_document: dict) -> None:
+        """Handle real-time shadow update from MQTT.
+
+        Updates stored device shadow properties from the MQTT shadow
+        document and notifies HA listeners immediately.
+        """
+        try:
+            current = shadow_document.get("current", {})
+            reported = current.get("state", {}).get("reported", {})
+            for _key, value in reported.items():
+                if isinstance(value, dict) and "properties" in value:
+                    properties = value["properties"]
+                    for device_data in self._devices.values():
+                        if device_data.get("device_code") == device_code:
+                            device_data["_shadow_properties"] = properties
+                            _LOGGER.debug("Updated shadow for %s via MQTT", device_code)
+                            break
+                    break
+            self.async_update_listeners()
+        except Exception as e:
+            _LOGGER.error("Error handling shadow update for %s: %s", device_code, e)
+
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from API."""
         try:
