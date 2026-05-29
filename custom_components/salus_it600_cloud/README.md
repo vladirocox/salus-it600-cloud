@@ -54,7 +54,7 @@ Full-featured Home Assistant integration for controlling Salus iT600 smart home 
 1. Open **HACS** in Home Assistant
 2. Click on **Integrations**
 3. Click the **⋮** menu → **Custom repositories**
-4. Add repository URL: `https://github.com/Peterka35/salus-it600-cloud`
+4. Add repository URL: `https://github.com/vladirocox/salus-it600-cloud`
 5. Category: **Integration**
 6. Click **Add**
 7. Search for "Salus iT600 Cloud"
@@ -293,8 +293,8 @@ Use at your own risk. The authors are not responsible for any damage to your dev
 
 ## 📞 Support
 
-- **Issues**: [GitHub Issues](https://github.com/Peterka35/salus-it600-cloud/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/Peterka35/salus-it600-cloud/discussions)
+- **Issues**: [GitHub Issues](https://github.com/vladirocox/salus-it600-cloud/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/vladirocox/salus-it600-cloud/discussions)
 - **Home Assistant Community**: [Forum Thread](https://community.home-assistant.io/)
 
 ## 🌟 Star History
