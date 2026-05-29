@@ -4,7 +4,7 @@
   "codeowners": [],
   "config_flow": true,
   "dependencies": [],
-  "documentation": "https://github.com/yourusername/salus_it600_cloud",
+  "documentation": "https://github.com/vladirocox/salus-it600-cloud",
   "integration_type": "hub",
   "iot_class": "cloud_polling",
   "requirements": [
