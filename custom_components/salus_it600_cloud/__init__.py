@@ -42,6 +42,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # Create coordinator
         coordinator = SalusCloudCoordinator(hass, gateway)
 
+        # Register real-time shadow update callback from MQTT
+        gateway.set_shadow_update_callback(coordinator._handle_shadow_update)
+
         # Fetch initial data
         await coordinator.async_config_entry_first_refresh()
 

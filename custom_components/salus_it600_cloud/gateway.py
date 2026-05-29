@@ -145,6 +145,7 @@ class SalusCloudGateway:
         self._mqtt_connected: bool = False
         self._mqtt_connect_event: asyncio.Event | None = None
         self._mqtt_connect_rc: int | None = None
+        self._shadow_update_callback: Any = None
 
     def _sync_authenticate(self) -> None:
         """Synchronous authentication (to be run in thread)."""
@@ -508,6 +509,10 @@ class SalusCloudGateway:
         _LOGGER.debug("Found total of %d OneTouch rule(s)", len(rules))
         return rules
 
+    def set_shadow_update_callback(self, callback: Any) -> None:
+        """Set callback for real-time shadow updates via MQTT."""
+        self._shadow_update_callback = callback
+
     async def _ensure_mqtt_connected(self) -> None:
         """Ensure MQTT client is connected to AWS IoT."""
         # Check if AWS IoT credentials need refresh (expired or expiring within 5 minutes)
@@ -601,10 +606,11 @@ class SalusCloudGateway:
                 if rc == 0:
                     _LOGGER.debug("MQTT connected successfully (rc=0)")
                     self._mqtt_connected = True
+                    client.subscribe("$aws/things/+/shadow/update/documents", qos=1)
+                    _LOGGER.debug("Subscribed to $aws/things/+/shadow/update/documents")
                 else:
                     _LOGGER.error("MQTT connection failed (rc=%s): %s", rc, mqtt.connack_string(rc))
                     self._mqtt_connected = False
-                # Signal that connection attempt is complete
                 if self._mqtt_connect_event:
                     self._event_loop.call_soon_threadsafe(self._mqtt_connect_event.set)
 
@@ -612,8 +618,21 @@ class SalusCloudGateway:
                 _LOGGER.warning("MQTT disconnected (rc=%s): %s", rc, mqtt.connack_string(rc) if rc > 0 else "Clean disconnect")
                 self._mqtt_connected = False
 
+            def on_message(client, userdata, msg):
+                try:
+                    topic = msg.topic
+                    if topic.endswith("/shadow/update/documents"):
+                        payload = json.loads(msg.payload)
+                        parts = topic.split("/")
+                        device_code = parts[2] if len(parts) >= 4 else None
+                        if device_code and self._shadow_update_callback:
+                            self._event_loop.call_soon_threadsafe(
+                                self._shadow_update_callback, device_code, payload
+                            )
+                except Exception as e:
+                    _LOGGER.error("Error processing MQTT message: %s", e)
+
             def on_log(client, userdata, level, buf):
-                # Map paho-mqtt log levels to Python logging levels
                 if level == mqtt.MQTT_LOG_ERR:
                     _LOGGER.error("MQTT: %s", buf)
                 elif level == mqtt.MQTT_LOG_WARNING:
@@ -631,6 +650,7 @@ class SalusCloudGateway:
 
             self._mqtt_client.on_connect = on_connect
             self._mqtt_client.on_disconnect = on_disconnect
+            self._mqtt_client.on_message = on_message
             self._mqtt_client.on_log = on_log
             self._mqtt_client.on_socket_open = on_socket_open
             self._mqtt_client.on_socket_close = on_socket_close
@@ -812,9 +832,29 @@ class SalusCloudGateway:
         temp_x100 = int(temperature * 100)
 
         properties = {
-            "ep9:sIT600TH:SetHeatingSetpoint_x100": temp_x100,
-            "ep9:sIT600TH:SetHoldType": 2,  # Hold temperature
-            "ep9:sIT600TH:SetSystemMode": 4,  # Heat mode
+            "ep1:sTherS:SetHeatingSetpoint_x100": temp_x100,
+            "ep1:sComm:SetHoldType": 2,  # Hold temperature
+            "ep1:sTherS:SetSystemMode": 4,  # Heat mode
+        }
+
+        await self.update_device_shadow(device_code, properties, device_index)
+
+    async def set_system_mode(
+        self, device_code: str, mode: int, device_index: str | None = None
+    ) -> None:
+        """Set thermostat system mode.
+
+        Args:
+            device_code: Device code of the thermostat
+            mode: System mode value
+                0 = Off
+                4 = Heat
+            device_index: Device index in shadow (optional)
+        """
+        _LOGGER.debug("Setting system mode for %s to %d", device_code, mode)
+
+        properties = {
+            "ep1:sTherS:SetSystemMode": mode,
         }
 
         await self.update_device_shadow(device_code, properties, device_index)
@@ -835,7 +875,7 @@ class SalusCloudGateway:
         _LOGGER.debug("Setting hold mode for %s to %d", device_code, mode)
 
         properties = {
-            "ep9:sIT600TH:SetHoldType": mode,
+            "ep1:sComm:SetHoldType": mode,
         }
 
         await self.update_device_shadow(device_code, properties, device_index)
@@ -847,7 +887,7 @@ class SalusCloudGateway:
         _LOGGER.debug("Setting switch %s to %s", device_code, "ON" if state else "OFF")
 
         properties = {
-            "ep9:sOnOffS:SetOnOff": 1 if state else 0
+            "ep2:sOnOffS:SetOnOff": 1 if state else 0
         }
 
         await self.update_device_shadow(device_code, properties, device_index)
