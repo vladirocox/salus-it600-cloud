@@ -91,14 +91,24 @@ class SalusCloudCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if device_id:
                     devices_dict[device_id] = device
 
+            # An empty result right after we previously had devices means the poll
+            # silently failed. Report it as an update failure so entities go
+            # unavailable rather than quietly reporting unknown values.
+            if not devices_dict and self._devices:
+                raise UpdateFailed(
+                    "Salus returned no devices although devices were previously found"
+                )
+
             self._devices = devices_dict
             _LOGGER.debug("Stored %d devices", len(devices_dict))
             return devices_dict
 
         except SalusCloudConnectionError as err:
             raise UpdateFailed(f"Error communicating with API: {err}") from err
+        except UpdateFailed:
+            raise
         except Exception as err:
-            raise UpdateFailed(f"Unexpected error: {err}") from err
+            raise UpdateFailed(f"Unexpected error: {err!r}") from err
 
     def get_device(self, device_id: str) -> dict[str, Any] | None:
         """Get device data by ID."""

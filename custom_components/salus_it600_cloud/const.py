@@ -17,6 +17,16 @@ AWS_IOT_ENDPOINT = "a24u3z7zzwrtdl-ats.iot.eu-central-1.amazonaws.com"
 SERVICE_API_BASE_URL = "https://service-api.eu.premium.salusconnect.io/api/v1"
 COMPANY_CODE = "salus-eu"
 
+# Request timeouts
+# The Salus cloud intermittently stalls (502/504), so the old 10s budget produced
+# a steady stream of timeouts that were then swallowed as empty errors.
+API_TIMEOUT_SECONDS = 30
+
+# MQTT connection behaviour
+MQTT_CONNECT_TIMEOUT_SECONDS = 20
+MQTT_BACKOFF_BASE_SECONDS = 5
+MQTT_BACKOFF_MAX_SECONDS = 300
+
 # Polling interval
 SCAN_INTERVAL_SECONDS = 30
 

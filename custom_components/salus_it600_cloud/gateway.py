@@ -16,12 +16,16 @@ from pycognito import Cognito
 from pycognito.exceptions import SoftwareTokenMFAChallengeException
 
 from .const import (
+    API_TIMEOUT_SECONDS,
     AWS_CLIENT_ID,
     AWS_IDENTITY_POOL_ID,
     AWS_IOT_ENDPOINT,
     AWS_REGION,
     AWS_USER_POOL_ID,
     COMPANY_CODE,
+    MQTT_BACKOFF_BASE_SECONDS,
+    MQTT_BACKOFF_MAX_SECONDS,
+    MQTT_CONNECT_TIMEOUT_SECONDS,
     SERVICE_API_BASE_URL,
 )
 
@@ -146,6 +150,16 @@ class SalusCloudGateway:
         self._mqtt_connect_event: asyncio.Event | None = None
         self._mqtt_connect_rc: int | None = None
         self._shadow_update_callback: Any = None
+        # Serialises connect attempts so concurrent service calls cannot each
+        # spin up their own client + network thread.
+        self._mqtt_lock: asyncio.Lock = asyncio.Lock()
+        # Prevents a reconnect storm when AWS IoT is unreachable.
+        self._mqtt_backoff_until: float = 0.0
+        # Device codes used to build per-device shadow subscription topics.
+        self._known_device_codes: list[str] = []
+        self._gateway_device_code: str | None = None
+        self._mqtt_client_id: str | None = None
+        self._event_loop: Any = None
 
     def _sync_authenticate(self) -> None:
         """Synchronous authentication (to be run in thread)."""
@@ -241,7 +255,7 @@ class SalusCloudGateway:
                     "Content-Type": "application/x-amz-json-1.1",
                     "X-Amz-Target": "AWSCognitoIdentityService.GetId",
                 },
-                timeout=aiohttp.ClientTimeout(total=10),
+                timeout=aiohttp.ClientTimeout(total=API_TIMEOUT_SECONDS),
             ) as response:
                 response.raise_for_status()
                 # AWS returns application/x-amz-json-1.1, need to ignore content type
@@ -265,7 +279,7 @@ class SalusCloudGateway:
                     "Content-Type": "application/x-amz-json-1.1",
                     "X-Amz-Target": "AWSCognitoIdentityService.GetCredentialsForIdentity",
                 },
-                timeout=aiohttp.ClientTimeout(total=10),
+                timeout=aiohttp.ClientTimeout(total=API_TIMEOUT_SECONDS),
             ) as response:
                 response.raise_for_status()
                 # AWS returns application/x-amz-json-1.1, need to ignore content type
@@ -324,7 +338,7 @@ class SalusCloudGateway:
 
         try:
             async with self._session.request(
-                method, url, headers=headers, timeout=aiohttp.ClientTimeout(total=10), **kwargs
+                method, url, headers=headers, timeout=aiohttp.ClientTimeout(total=API_TIMEOUT_SECONDS), **kwargs
             ) as response:
                 response.raise_for_status()
                 result = await response.json()
@@ -338,7 +352,7 @@ class SalusCloudGateway:
                 # Retry once after re-authentication
                 headers = self._get_headers()
                 async with self._session.request(
-                    method, url, headers=headers, timeout=aiohttp.ClientTimeout(total=10), **kwargs
+                    method, url, headers=headers, timeout=aiohttp.ClientTimeout(total=API_TIMEOUT_SECONDS), **kwargs
                 ) as response:
                     response.raise_for_status()
                     return await response.json()
@@ -346,6 +360,15 @@ class SalusCloudGateway:
 
         except aiohttp.ClientError as err:
             raise SalusCloudConnectionError(f"Connection error: {err}") from err
+
+        except (asyncio.TimeoutError, TimeoutError) as err:
+            # asyncio.TimeoutError is an alias of the builtin TimeoutError, which is
+            # NOT an aiohttp.ClientError. Without this branch it escaped the handlers
+            # above and was swallowed by a broad `except Exception`, logging as an
+            # empty message and silently returning partial/empty data.
+            raise SalusCloudConnectionError(
+                f"API request timed out after {API_TIMEOUT_SECONDS}s: {method} {url}"
+            ) from err
 
     async def get_gateways(self) -> list[dict[str, Any]]:
         """Get list of gateways."""
@@ -436,6 +459,11 @@ class SalusCloudGateway:
                         if device_code:
                             device_codes.append(device_code)
 
+            except SalusCloudConnectionError:
+                # Do not swallow transport failures: returning an empty device list
+                # makes the coordinator report success while every entity silently
+                # loses its data. Propagate so the update is marked failed.
+                raise
             except Exception as err:
                 _LOGGER.error("Failed to get details for gateway %s: %s", gateway_id, err)
                 continue
@@ -513,225 +541,284 @@ class SalusCloudGateway:
         """Set callback for real-time shadow updates via MQTT."""
         self._shadow_update_callback = callback
 
-    async def _ensure_mqtt_connected(self) -> None:
-        """Ensure MQTT client is connected to AWS IoT."""
-        # Check if AWS IoT credentials need refresh (expired or expiring within 5 minutes)
-        credentials_need_refresh = (
-            not self._aws_access_key
-            or not self._aws_credentials_expiry
-            or datetime.now(timezone.utc) >= self._aws_credentials_expiry - timedelta(minutes=5)
-        )
+    def _mqtt_shadow_topics(self) -> list[str]:
+        """Build the list of shadow topics we are allowed to subscribe to.
 
-        if credentials_need_refresh:
-            if self._aws_access_key:
-                _LOGGER.debug("AWS IoT credentials expired or expiring soon, refreshing")
-                # Disconnect existing MQTT client if credentials are being refreshed
-                if self._mqtt_client and self._mqtt_connected:
-                    _LOGGER.debug("Disconnecting MQTT before refreshing credentials")
-                    try:
-                        self._mqtt_client.loop_stop()
-                        self._mqtt_client.disconnect()
-                    except Exception as err:
-                        _LOGGER.debug("Error disconnecting MQTT: %s", err)
-                    self._mqtt_connected = False
-                    self._mqtt_client = None
-            else:
-                _LOGGER.debug("Getting AWS IoT credentials first")
+        AWS IoT rejects a subscription to the wildcard topic
+        "$aws/things/+/shadow/update/documents": the policy only grants access to
+        each device's own shadow. Attempting the wildcard made AWS accept the
+        CONNACK and then immediately close the socket, which surfaced as a
+        constant stream of rc=7 disconnects and made every write fail with
+        "The client is not currently connected".
+        """
+        topics: list[str] = []
+        seen: set[str] = set()
 
-            await self._get_aws_iot_credentials()
+        for code in self._known_device_codes:
+            if code and code not in seen:
+                seen.add(code)
+                topics.append(f"$aws/things/{code}/shadow/update/documents")
 
-        # Check both flag AND actual connection status
-        if self._mqtt_connected and self._mqtt_client and self._mqtt_client.is_connected():
-            _LOGGER.debug("MQTT already connected, skipping")
+        if self._gateway_device_code and self._gateway_device_code not in seen:
+            topics.append(
+                f"$aws/things/{self._gateway_device_code}/shadow/update/documents"
+            )
+
+        if not topics:
+            _LOGGER.warning(
+                "No device codes known yet; skipping MQTT shadow subscriptions"
+            )
+        return topics
+
+    async def _refresh_known_device_codes(self) -> None:
+        """Refresh the cached device codes used to build shadow topics."""
+        try:
+            devices = await self.get_all_devices()
+        except Exception as err:
+            _LOGGER.debug("Could not refresh device codes: %s", err)
             return
 
-        # If flag says connected but client isn't, reset the flag
-        if self._mqtt_connected and self._mqtt_client and not self._mqtt_client.is_connected():
-            _LOGGER.warning("MQTT flag says connected but client is disconnected, resetting")
-            self._mqtt_connected = False
+        codes: list[str] = []
+        for device in devices:
+            code = device.get("device_code")
+            if code:
+                codes.append(code)
+        if codes:
+            self._known_device_codes = codes
+            _LOGGER.debug("Known device codes for MQTT topics: %s", codes)
 
+    def _invalidate_aws_credentials(self) -> None:
+        """Drop cached AWS IoT credentials so the next attempt re-fetches them."""
+        if self._aws_access_key:
+            _LOGGER.debug("Invalidating cached AWS IoT credentials")
+        self._aws_access_key = None
+        self._aws_secret_key = None
+        self._aws_session_token = None
+        self._aws_credentials_expiry = None
+
+    def _aws_credentials_valid(self) -> bool:
+        """Return True if we hold AWS IoT credentials that are still usable."""
+        if not self._aws_access_key or not self._aws_credentials_expiry:
+            return False
+        # Refresh with a safety margin so the signature never expires mid-flight.
+        return datetime.now(timezone.utc) < self._aws_credentials_expiry - timedelta(minutes=5)
+
+    def _dispose_mqtt_client(self) -> None:
+        """Tear down the current MQTT client and its network thread."""
+        client = self._mqtt_client
+        self._mqtt_client = None
+        self._mqtt_connected = False
+        self._mqtt_connect_event = None
+        self._mqtt_connect_rc = None
+        if client is None:
+            return
         try:
-            _LOGGER.debug("Starting MQTT connection to AWS IoT")
+            client.loop_stop()
+        except Exception as err:  # pragma: no cover - defensive
+            _LOGGER.debug("Error stopping MQTT loop: %s", err)
+        try:
+            client.disconnect()
+        except Exception as err:  # pragma: no cover - defensive
+            _LOGGER.debug("Error disconnecting MQTT client: %s", err)
 
-            _LOGGER.debug("Creating signed WebSocket URL...")
-            # Create signed WebSocket URL
-            websocket_url = _create_signed_websocket_url(
-                host=AWS_IOT_ENDPOINT,
-                region=AWS_REGION,
-                access_key=self._aws_access_key,
-                secret_key=self._aws_secret_key,
-                session_token=self._aws_session_token,
-            )
+    def _schedule_mqtt_event(self, callback: Any) -> None:
+        """Run a callback on the event loop from a paho network thread."""
+        loop = self._event_loop
+        if loop is None:
+            return
+        try:
+            if loop.is_closed():
+                return
+            loop.call_soon_threadsafe(callback)
+        except RuntimeError:
+            pass
 
-            _LOGGER.debug("Created signed WebSocket URL for AWS IoT")
-            _LOGGER.debug("WebSocket URL (first 100 chars): %s...", websocket_url[:100])
+    async def _connect_mqtt_once(self) -> None:
+        """Create a client and connect, returning only once CONNACK arrives.
 
-            # Get gateway info for client ID (required for AWS IoT policy)
-            # AWS IoT policy expects client ID format: {GATEWAY_DEVICE_CODE}-{UUID}
-            if not hasattr(self, '_gateway_device_code'):
-                gateways = await self.get_gateways()
-                if not gateways:
-                    raise SalusCloudConnectionError("No gateways found for MQTT client ID")
+        Raises SalusCloudConnectionError if the connection was not established.
+        """
+        if not self._aws_credentials_valid():
+            await self._get_aws_iot_credentials()
 
-                gateway = gateways[0]
-                gateway_data = gateway.get("gateway", {})
-                self._gateway_device_code = gateway_data.get("device_code", "")
+        websocket_url = _create_signed_websocket_url(
+            host=AWS_IOT_ENDPOINT,
+            region=AWS_REGION,
+            access_key=self._aws_access_key,
+            secret_key=self._aws_secret_key,
+            session_token=self._aws_session_token,
+        )
 
-                if not self._gateway_device_code:
-                    raise SalusCloudConnectionError("Gateway device_code not found")
+        if not self._gateway_device_code:
+            gateways = await self.get_gateways()
+            if not gateways:
+                raise SalusCloudConnectionError("No gateways found for MQTT client ID")
+            gateway_data = gateways[0].get("gateway", {})
+            self._gateway_device_code = gateway_data.get("device_code", "")
+            if not self._gateway_device_code:
+                raise SalusCloudConnectionError("Gateway device_code not found")
 
-                _LOGGER.debug("Using gateway device_code for MQTT: %s", self._gateway_device_code)
+        # Make sure we know the device codes so we can subscribe to each device's
+        # own shadow topic.
+        if not self._known_device_codes:
+            await self._refresh_known_device_codes()
 
-            # Create event for waiting on connection
-            self._mqtt_connect_event = asyncio.Event()
-            self._event_loop = asyncio.get_running_loop()  # Store reference for thread-safe callbacks
-            self._mqtt_connect_rc = None
-
-            # Create MQTT client with WebSocket
-            # Client ID format: {GATEWAY_DEVICE_CODE}-{RANDOM_UUID}
-            # Example: SAU2AG1_GW-001E5E044354-a1b2c3d4-e5f6-4789-a0b1-c2d3e4f5g6h7
+        # One stable client ID for the lifetime of the connection. Previously a new
+        # uuid4() was minted per attempt, which left orphaned network threads behind
+        # and made AWS treat each retry as a brand new device connection.
+        if not self._mqtt_client_id:
             import uuid
-            connection_uuid = str(uuid.uuid4())
-            client_id = f"{self._gateway_device_code}-{connection_uuid}"
-            _LOGGER.debug("Creating MQTT client with ID: %s", client_id)
-            self._mqtt_client = mqtt.Client(
-                client_id=client_id,
-                transport="websockets",
-                protocol=mqtt.MQTTv311,  # AWS IoT requires MQTT 3.1.1
+
+            self._mqtt_client_id = f"{self._gateway_device_code}-{uuid.uuid4()}"
+
+        self._event_loop = asyncio.get_running_loop()
+        self._mqtt_connect_rc = None
+        connected_event = asyncio.Event()
+        self._mqtt_connect_event = connected_event
+
+        client = mqtt.Client(
+            client_id=self._mqtt_client_id,
+            transport="websockets",
+            protocol=mqtt.MQTTv311,  # AWS IoT requires MQTT 3.1.1
+        )
+
+        def on_connect(_client, _userdata, _flags, rc):
+            self._mqtt_connect_rc = rc
+            if rc == 0:
+                _LOGGER.info("MQTT connected to AWS IoT (client_id=%s)", self._mqtt_client_id)
+                self._mqtt_connected = True
+                # Subscribe per-device. A wildcard topic is refused by the IoT
+                # policy and causes AWS to drop the socket right after CONNACK.
+                for topic in self._mqtt_shadow_topics():
+                    try:
+                        _client.subscribe(topic, qos=1)
+                        _LOGGER.debug("Subscribed to %s", topic)
+                    except Exception as err:  # pragma: no cover - defensive
+                        _LOGGER.warning("Subscribe to %s failed: %s", topic, err)
+            else:
+                _LOGGER.error("MQTT CONNACK refused with rc=%s", rc)
+                self._mqtt_connected = False
+            self._schedule_mqtt_event(connected_event.set)
+
+        def on_disconnect(_client, _userdata, rc):
+            was_connected = self._mqtt_connected
+            self._mqtt_connected = False
+            # rc=7 is paho's MQTT_ERR_CONN_LOST: the socket died before CONNACK.
+            if was_connected or rc != 0:
+                _LOGGER.warning("MQTT disconnected (rc=%s)", rc)
+            self._schedule_mqtt_event(connected_event.set)
+
+        def on_message(_client, _userdata, msg):
+            try:
+                topic = msg.topic
+                if topic.endswith("/shadow/update/documents"):
+                    payload = json.loads(msg.payload)
+                    parts = topic.split("/")
+                    device_code = parts[2] if len(parts) >= 4 else None
+                    if device_code and self._shadow_update_callback and self._event_loop:
+                        self._event_loop.call_soon_threadsafe(
+                            self._shadow_update_callback, device_code, payload
+                        )
+            except Exception as err:
+                _LOGGER.error("Error processing MQTT message: %s", err)
+
+        client.on_connect = on_connect
+        client.on_disconnect = on_disconnect
+        client.on_message = on_message
+        client.on_log = lambda c, u, lvl, buf: _LOGGER.debug("MQTT: %s", buf)
+
+        def connect_sync():
+            client.tls_set()
+            from urllib.parse import urlparse
+
+            parsed = urlparse(websocket_url)
+            # Path must include the full signed query string.
+            client.ws_set_options(
+                path=f"{parsed.path}?{parsed.query}",
+                headers={"Sec-WebSocket-Protocol": "mqtt"},
+            )
+            client.connect(parsed.hostname, 443, 60)
+            client.loop_start()
+
+        self._mqtt_client = client
+        await asyncio.to_thread(connect_sync)
+
+        # Wait for the real CONNACK instead of sleeping and assuming success.
+        try:
+            await asyncio.wait_for(
+                connected_event.wait(), timeout=MQTT_CONNECT_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError as err:
+            raise SalusCloudConnectionError(
+                f"MQTT did not receive CONNACK within {MQTT_CONNECT_TIMEOUT_SECONDS}s"
+            ) from err
+
+        if not self._mqtt_connected:
+            raise SalusCloudConnectionError(
+                f"MQTT connection failed (CONNACK rc={self._mqtt_connect_rc})"
             )
 
-            # Add MQTT callbacks for debugging
-            def on_connect(client, userdata, flags, rc):
-                self._mqtt_connect_rc = rc
-                if rc == 0:
-                    _LOGGER.debug("MQTT connected successfully (rc=0)")
-                    self._mqtt_connected = True
-                    client.subscribe("$aws/things/+/shadow/update/documents", qos=1)
-                    _LOGGER.debug("Subscribed to $aws/things/+/shadow/update/documents")
-                else:
-                    _LOGGER.error("MQTT connection failed (rc=%s): %s", rc, mqtt.connack_string(rc))
-                    self._mqtt_connected = False
-                if self._mqtt_connect_event:
-                    self._event_loop.call_soon_threadsafe(self._mqtt_connect_event.set)
+    async def _ensure_mqtt_connected(self) -> None:
+        """Ensure MQTT client is connected to AWS IoT."""
+        # Fast path without taking the lock.
+        if (
+            self._mqtt_connected
+            and self._mqtt_client is not None
+            and self._mqtt_client.is_connected()
+        ):
+            return
 
-            def on_disconnect(client, userdata, rc):
-                _LOGGER.warning("MQTT disconnected (rc=%s): %s", rc, mqtt.connack_string(rc) if rc > 0 else "Clean disconnect")
-                self._mqtt_connected = False
+        async with self._mqtt_lock:
+            if (
+                self._mqtt_connected
+                and self._mqtt_client is not None
+                and self._mqtt_client.is_connected()
+            ):
+                return
 
-            def on_message(client, userdata, msg):
+            loop = asyncio.get_running_loop()
+            if loop.time() < self._mqtt_backoff_until:
+                wait_for = self._mqtt_backoff_until - loop.time()
+                raise SalusCloudConnectionError(
+                    f"MQTT connect backing off for another {wait_for:.0f}s "
+                    "(AWS IoT connection is failing)"
+                )
+
+            last_error: Exception | None = None
+
+            # Two attempts: the first may legitimately fail if our cached AWS
+            # credentials expired, in which case we re-fetch and retry once.
+            for attempt in range(2):
                 try:
-                    topic = msg.topic
-                    if topic.endswith("/shadow/update/documents"):
-                        payload = json.loads(msg.payload)
-                        parts = topic.split("/")
-                        device_code = parts[2] if len(parts) >= 4 else None
-                        if device_code and self._shadow_update_callback:
-                            self._event_loop.call_soon_threadsafe(
-                                self._shadow_update_callback, device_code, payload
-                            )
-                except Exception as e:
-                    _LOGGER.error("Error processing MQTT message: %s", e)
-
-            def on_log(client, userdata, level, buf):
-                if level == mqtt.MQTT_LOG_ERR:
-                    _LOGGER.error("MQTT: %s", buf)
-                elif level == mqtt.MQTT_LOG_WARNING:
-                    _LOGGER.warning("MQTT: %s", buf)
-                elif level == mqtt.MQTT_LOG_NOTICE:
-                    _LOGGER.debug("MQTT: %s", buf)
-                else:
-                    _LOGGER.debug("MQTT: %s", buf)
-
-            def on_socket_open(client, userdata, sock):
-                _LOGGER.debug("MQTT WebSocket opened")
-
-            def on_socket_close(client, userdata, sock):
-                _LOGGER.debug("MQTT WebSocket closed")
-
-            self._mqtt_client.on_connect = on_connect
-            self._mqtt_client.on_disconnect = on_disconnect
-            self._mqtt_client.on_message = on_message
-            self._mqtt_client.on_log = on_log
-            self._mqtt_client.on_socket_open = on_socket_open
-            self._mqtt_client.on_socket_close = on_socket_close
-
-            # Enable debug logging for MQTT
-            self._mqtt_client.enable_logger(_LOGGER)
-
-            # Connect in a thread (paho-mqtt is synchronous)
-            def connect_sync():
-                try:
-                    # Set TLS (required for wss://) - must be in thread to avoid blocking
-                    _LOGGER.debug("Setting up TLS for WebSocket connection")
-                    import ssl
-                    # Use default SSL context with proper cert verification
-                    self._mqtt_client.tls_set(
-                        cert_reqs=ssl.CERT_REQUIRED,
-                        tls_version=ssl.PROTOCOL_TLSv1_2
-                    )
-
-                    # Parse URL to get host and path with query params
-                    import urllib.parse
-                    parsed = urllib.parse.urlparse(websocket_url)
-
-                    _LOGGER.debug("Setting WebSocket options - host: %s, path: %s", parsed.hostname, parsed.path)
-                    _LOGGER.debug("Query params length: %d chars", len(parsed.query))
-
-                    # Set the full path with query parameters
-                    # NOTE: AWS IoT requires the WebSocket subprotocol to be "mqtt"
-                    self._mqtt_client.ws_set_options(
-                        path=f"{parsed.path}?{parsed.query}",
-                        headers={
-                            "Sec-WebSocket-Protocol": "mqtt"
-                        }
-                    )
-
-                    # Connect (default port 443 for wss)
-                    _LOGGER.debug("Connecting to MQTT broker at %s:443", parsed.hostname)
-                    self._mqtt_client.connect(parsed.hostname, 443, keepalive=60)
-                    _LOGGER.debug("MQTT connect() call completed, starting network loop")
-                    self._mqtt_client.loop_start()
-                    _LOGGER.debug("MQTT loop_start() completed")
-
-                except Exception as e:
-                    _LOGGER.error("Exception in MQTT connect_sync: %s", e, exc_info=True)
-                    # Signal event even on error so we don't hang
-                    if self._mqtt_connect_event:
-                        import asyncio
-                        loop = asyncio.get_event_loop()
-                        loop.call_soon_threadsafe(self._mqtt_connect_event.set)
+                    await self._connect_mqtt_once()
+                    self._mqtt_backoff_until = 0.0
+                    return
+                except SalusCloudAuthenticationError:
+                    # Credential fetch itself failed; retrying immediately is futile.
                     raise
+                except Exception as err:
+                    last_error = err
+                    _LOGGER.warning(
+                        "MQTT connect attempt %s/2 failed: %s", attempt + 1, err
+                    )
+                    self._dispose_mqtt_client()
+                    if attempt == 0:
+                        # Credentials are the usual culprit - drop them and retry.
+                        _LOGGER.debug("Refreshing AWS IoT credentials before retry")
+                        self._invalidate_aws_credentials()
 
-            _LOGGER.debug("Starting MQTT connection in background thread")
-            await asyncio.to_thread(connect_sync)
-
-            # Wait for connection callback (with timeout)
-            _LOGGER.debug("Waiting for MQTT connection callback...")
-            try:
-                await asyncio.wait_for(self._mqtt_connect_event.wait(), timeout=10.0)
-            except asyncio.TimeoutError:
-                _LOGGER.error("MQTT connection timeout - no callback received within 10 seconds")
-                raise SalusCloudConnectionError("MQTT connection timeout")
-
-            # Check connection result
-            if self._mqtt_connect_rc != 0:
-                error_msg = f"MQTT connection failed with code {self._mqtt_connect_rc}"
-                if self._mqtt_connect_rc:
-                    error_msg += f": {mqtt.connack_string(self._mqtt_connect_rc)}"
-                _LOGGER.error(error_msg)
-                raise SalusCloudConnectionError(error_msg)
-
-            _LOGGER.debug("MQTT connection established successfully")
-
-        except Exception as err:
-            _LOGGER.error("Failed to connect to AWS IoT MQTT: %s", err, exc_info=True)
-            self._mqtt_connected = False
-            if self._mqtt_client:
-                try:
-                    self._mqtt_client.loop_stop()
-                except:
-                    pass
-            raise SalusCloudConnectionError(f"Failed to connect to AWS IoT MQTT: {err}") from err
+            # Both attempts failed: back off exponentially so we stop hammering.
+            delay = min(
+                MQTT_BACKOFF_MAX_SECONDS,
+                MQTT_BACKOFF_BASE_SECONDS * (2 ** (attempt + 1)),
+            )
+            self._mqtt_backoff_until = asyncio.get_running_loop().time() + delay
+            _LOGGER.error(
+                "MQTT unavailable, backing off %ss: %s", delay, last_error
+            )
+            raise SalusCloudConnectionError(
+                f"Failed to connect to AWS IoT MQTT: {last_error}"
+            ) from last_error
 
     async def update_device_shadow(
         self, device_code: str, properties: dict[str, Any], device_index: str | None = None
@@ -804,10 +891,12 @@ class SalusCloudGateway:
                 _LOGGER.debug("Successfully published shadow update for %s (index: %s)", device_code, device_index)
 
             except SalusCloudConnectionError as err:
-                # If publish failed due to disconnection, try to reconnect and retry once
-                if "not currently connected" in str(err):
+                # If publish failed due to disconnection, rebuild the client and retry once.
+                if "not currently connected" in str(err) or "not initialized" in str(err):
                     _LOGGER.warning("MQTT disconnected during publish, reconnecting and retrying...")
-                    self._mqtt_connected = False
+                    # Dispose rather than just flipping the flag, otherwise a dead
+                    # client object stays in place and the retry keeps failing.
+                    self._dispose_mqtt_client()
                     await self._ensure_mqtt_connected()
 
                     # Retry publish
@@ -818,8 +907,9 @@ class SalusCloudGateway:
 
         except Exception as err:
             _LOGGER.error("Failed to update device shadow: %s", err, exc_info=True)
-            # Reset MQTT connection on error
-            self._mqtt_connected = False
+            # Drop the connection so the next call rebuilds it. Previously this only
+            # flipped a boolean, leaving a dead client object in place.
+            self._dispose_mqtt_client()
             raise SalusCloudConnectionError(f"Failed to update device shadow: {err}") from err
 
     async def set_temperature(
@@ -978,14 +1068,12 @@ class SalusCloudGateway:
     async def close(self) -> None:
         """Close the session."""
         # Close MQTT connection
-        if self._mqtt_client:
-            try:
-                self._mqtt_client.loop_stop()
-                self._mqtt_client.disconnect()
-            except Exception as err:
-                _LOGGER.debug("Error closing MQTT client: %s", err)
-            self._mqtt_client = None
-            self._mqtt_connected = False
+        self._dispose_mqtt_client()
+        self._mqtt_client_id = None
+        self._mqtt_backoff_until = 0.0
+        self._known_device_codes = []
+        self._gateway_device_code = None
+        self._invalidate_aws_credentials()
 
         # Close HTTP session
         if self._session and not self._session.closed:

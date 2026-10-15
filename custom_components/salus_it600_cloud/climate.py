@@ -145,6 +145,17 @@ class SalusCloudClimate(CoordinatorEntity[SalusCloudCoordinator], ClimateEntity)
         return self.coordinator.get_device(self._device_id) or {}
 
     @property
+    def available(self) -> bool:
+        """Return True when the coordinator has fresh data for this device.
+
+        Without this the entity stayed "available" while every property resolved
+        to None, so the UI silently showed unknown instead of unavailable.
+        """
+        if not self.coordinator.last_update_success:
+            return False
+        return bool(self.device_data)
+
+    @property
     def current_temperature(self) -> float | None:
         """Return the current temperature."""
         data = self.device_data

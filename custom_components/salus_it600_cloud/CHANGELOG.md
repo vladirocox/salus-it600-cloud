@@ -5,6 +5,52 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-10-15
+
+### Fixed
+- 🐛 **Critical: wildcard MQTT subscription broke all control**
+  - The integration subscribed to `$aws/things/+/shadow/update/documents` on connect.
+    AWS IoT's policy only grants each device access to its own shadow, so AWS accepted
+    the CONNACK (rc=0) and then immediately closed the socket (~1.3s).
+  - Symptoms: every `climate.set_temperature` / `set_hvac_mode` / `set_preset_mode`
+    failed with `Message publish failed: The client is not currently connected`, and the
+    log filled with ~1,500 `MQTT disconnected (rc=7)` warnings.
+  - Now subscribes per device (`$aws/things/{device_code}/shadow/update/documents`)
+    using the known device codes, so the connection stays up.
+  - Verified by isolating four connection scenarios: no-subscribe, wildcard subscribe,
+    exact-topic subscribe and `clean_session=False`. Only the wildcard was killed.
+- 🐛 **Connection state assumed success instead of waiting for CONNACK**
+  - The old code did `await asyncio.sleep(2)` and then set `_mqtt_connected = True`
+    unconditionally, so a failed connect was reported as connected and every service
+    call retried against a dead client.
+  - Now waits for the real CONNACK with a timeout and only reports connected on rc=0.
+- 🐛 **MQTT client leak / reconnect storm**
+  - A new `uuid4()` client ID was minted per attempt and old clients were never
+    stopped with `loop_stop()`, leaking paho network threads.
+  - Now reuses one stable client ID per connection and tears down properly via
+    `_dispose_mqtt_client()` on every error path.
+- 🐛 **Concurrent service calls each spawned their own MQTT client**
+  - Added an `asyncio.Lock` so parallel `climate.*` calls serialise their connect.
+- 🐛 **API timeouts were silently swallowed**
+  - `asyncio.TimeoutError` is a builtin `TimeoutError`, not an `aiohttp.ClientError`,
+    so it bypassed the error handlers and was caught by a broad `except Exception`,
+    logging with an empty message and returning partial/empty data.
+  - Now handled explicitly and raised as `SalusCloudConnectionError`.
+- 🐛 **Coordinator reported success with zero devices**
+  - A failed poll returned an empty device list without raising, so entities kept
+    reporting `available` while every property was `None`.
+  - An empty result after previously having devices now raises `UpdateFailed`.
+
+### Changed
+- MQTT connect now refreshes AWS credentials once and retries before backing off
+  exponentially (5s → 300s), instead of hammering AWS IoT.
+- API request timeout raised from 10s to 30s to tolerate the Salus cloud's
+  intermittent 502/504 responses.
+- `climate` entities now expose `available`, reporting unavailable when the
+  coordinator has no fresh data rather than silently showing unknown.
+- Per-request and per-device logging downgraded from INFO to DEBUG to stop
+  "logging too frequently" warnings.
+
 ## [1.0.3] - 2025-11-12
 
 ### Fixed
