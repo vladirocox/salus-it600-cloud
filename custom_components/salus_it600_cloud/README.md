@@ -267,9 +267,11 @@ Then check logs at **Settings** → **System** → **Logs**.
 
 ## 🤝 Contributing
 
-Contributions are welcome! To contribute:
+The canonical project is [Peterka35/salus-it600-cloud](https://github.com/Peterka35/salus-it600-cloud).
+Upstream fixes and features should be proposed there; the IT800TX contribution from this fork is
+[PR #11](https://github.com/Peterka35/salus-it600-cloud/pull/11).
 
-1. Fork the repository
+1. Fork [Peterka35/salus-it600-cloud](https://github.com/Peterka35/salus-it600-cloud)
 2. Create a feature branch
 3. Make your changes
 4. Test thoroughly
@@ -293,8 +295,8 @@ Use at your own risk. The authors are not responsible for any damage to your dev
 
 ## 📞 Support
 
-- **Issues**: [GitHub Issues](https://github.com/vladirocox/salus-it600-cloud/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/vladirocox/salus-it600-cloud/discussions)
+- **Issues**: [GitHub Issues](https://github.com/Peterka35/salus-it600-cloud/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/Peterka35/salus-it600-cloud/discussions)
 - **Home Assistant Community**: [Forum Thread](https://community.home-assistant.io/)
 
 ## 🌟 Star History
