@@ -185,7 +185,7 @@ Temperature and mode changes are sent via MQTT to AWS IoT device shadows using t
 
 Automatically installed:
 - `pycognito==2024.5.1` - AWS Cognito authentication
-- `paho-mqtt>=1.6.1` - MQTT client for AWS IoT
+- `paho-mqtt>=2.0.0` - MQTT client for AWS IoT
 
 ## 🔍 Supported Devices
 
